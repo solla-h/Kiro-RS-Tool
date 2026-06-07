@@ -1,0 +1,487 @@
+# Changelog
+
+All notable changes to this project are documented in this file. The format
+loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
+project adheres to [Semantic Versioning](https://semver.org/).
+
+## [Unreleased]
+
+## [0.6.2] - 2026-06-07
+
+主题：**Builder ID/free 流式对话 profileArn 400 修复 + 后台前端依赖清理**。v0.6.1 为规避占位符 ARN 的 403 风险，曾剥离 BuilderID 占位 `profileArn`；但新版 `q.* /generateAssistantResponse` 对 Builder ID/free 账号仍强制要求该字段，缺失会报 `400 "profileArn is required for this request."`。本版恢复纯 Builder ID/free 流式请求体的占位 ARN，同时保留 Enterprise / IdC 账号解析真实 ARN 的路径。
+
+### 🛠 修复
+
+- **恢复 Builder ID 占位 profileArn 注入**：`KiroCredentials::streaming_profile_arn()` 对 OAuth Builder ID/free 凭据会原样返回显式占位 ARN；未填充时按官方 IDE 行为回退到 Builder ID 默认占位 ARN，避免流式端点因缺少 `profileArn` 返回 400。
+- **保留 Enterprise / IdC 真实 ARN 优先级**：发起流式请求前仍会通过 `resolve_profile_arn_for` 尝试解析并回填 Enterprise / IdC 真实 `profileArn`；解析成功后使用真实 ARN，纯 Builder ID 无 Enterprise profile 时才回退占位 ARN。
+- **补充回归测试**：覆盖显式 Builder ID 占位 ARN、未填充 Builder ID/free 凭据、Social 固定 ARN、真实 ARN 与 API Key 凭据的流式 `profileArn` 行为。
+
+### 🧹 清理
+
+- 后台下拉框已改为基于 `DropdownMenu` 的实现；当前依赖树中没有保留未使用的 `@radix-ui/react-select`。
+
+## [0.6.0] - 2026-06-07
+
+主题：**Enterprise / IAM Identity Center 凭据全链路打通 + 流式对话 profileArn 修复 + 登录体验对齐官方 IDE**。
+
+### 🛠 修复
+
+- **流式对话 profileArn 修复**：IDE / CLI 流式端点按官方行为发送 `profileArn`；BuilderID/Social 缺省时补官方默认 ARN，Enterprise / IdC 首次请求通过 `ListAvailableProfiles` 获取真实 ARN 并写回凭据。
+- **Enterprise / IdC 用量与模型查询修复**：`getUsageLimits` / `ListAvailableModels` / `setUserPreference` 固定使用兼容的 `KiroIDE-0.9.2` 标识，跳过 BuilderID 占位 ARN，仅发送真实 profileArn，并在 `us-east-1` / `eu-central-1` 间做 403 回退。
+- **Kiro IDE 版本自动获取**：新增官方稳定版元数据拉取与进程内缓存，IDE/Social 相关 User-Agent 优先使用当前 IDE 版本；失败时回退配置版本。
+
+### ✨ 新功能
+
+- **普通 429 重试策略**：新增 `retryMode` / `retryPolicy` 配置、Admin API `/api/admin/config/retry-policy`、前端策略面板与凭据卡片普通 429 冷却展示。普通 429 不再禁用凭据，而是短暂冷却并按策略切换到其他可用凭据。
+
+## [0.5.9] - 2026-06-03
+
+主题：**客户端行为纠偏 + 按凭据拉取上游真实可用模型**。此前客户端传入的畸形请求体（tool_use/tool_result 不配对等）会导致上游 Bedrock 返回 503，触发重试风暴；批量工具混入 native web_search 也缺少端到端 handler。模型列表方面，免费凭据无法用 Opus 但此前无可见性——现在可按凭据实时查看上游订阅的真实可用模型。
+
+### ✨ 新功能
+
+- **凭据级上游模型查询**（PR #12 @ZyphrZero）：新增 `GET /api/admin/credentials/{id}/models` 接口，实时查询上游 `ListAvailableModels` API 获取该凭据当前可用模型（随订阅等级变化，FREE 不含 Opus）。在凭据卡片「更多操作」弹出独立弹窗，展示模型名、ID、最大输入 token 数。后端整条链路对标现有"余额"功能，新增 `src/kiro/model/available_models.rs` 响应 DTO、`token_manager` 抽出 `prepare_request_token` helper 消除重复的 token 刷新逻辑。
+  > 仅限 admin 面板按需拉取，不影响客户端 `GET /v1/models` 静态聚合列表。
+
+### 🛠 修复
+
+- **从源头阻断 503 风暴**（@ZyphrZero）：`provider.rs` 与 endpoint 层新增 `is_bad_request` 判别，把上游 Bedrock 因客户端格式错误（tool_use/tool_result 不配对等）返回的 503 在结束即刻识别为不可重试错误——不走重试、不切换凭据，直接返回 400 给客户端。此前这类错误被当成瞬态故障反复重试，会放大成一次坏请求 → 全部凭据接连被打 → 瞬时数百次 503。
+- **Bedrock 客户端校验错误映射为 400**（PR #10 @xiaojiou176）：`src/anthropic/handlers.rs` 对 Bedrock 返回的 `ValidationException`（消息序列非法、缺少 content 等）统一返回 `400 Bad Request` 而非 `502 Bad Gateway`，避免下游客户端误判为上游故障并无效重试。
+
+### ✨ 新功能 — 来自社区贡献
+
+感谢以下 PR 贡献者 🙏
+
+- **Native WebSearch 端到端循环**（PR #9 @xiaojiou176）：批量工具中混入 `web_search` 时，进入 agentic 内部循环——先调上游获取搜索结果，把结果注入回消息作为 tool_result，再继续对话。完全在 MCP 端点 `q.{region}.amazonaws.com/mcp` 上完成，不依赖外部搜索 API。
+- **`output_config.effort` 直通上游**（PR #8 @xiaojiou176）：Anthropic 协议 `reasoning.effort` 字段（low/medium/high）映射到 Kiro/Q 协议 `outputConfiguration.agentMode` 字段，让不同推理强度的请求在 Kiro 上游获得对应的资源分配。
+- **图片 MIME 修正与智能降采样**（PR #7 @xiaojiou176）：用 `magic-bytes` 从二进制头识别真实图片格式，修正错误声明的 MIME；超尺寸图片自动降采样到 1M 像素并重编码为 JPEG；`tool_result` 中的 base64 图片上浮到 user message 级 `images: [...]`，避免被上游忽略。
+
+### 📦 升级指南
+
+1. **`docker compose pull && docker compose up -d`** 即可。无破坏性变更，无需清理状态文件。
+2. **查看凭据可用模型**：登录管理面板 → 凭据管理 → 任一凭据卡片「更多操作」→「查看可用模型」，实时查询上游。
+
+## [0.5.8] - 2026-06-01
+
+主题：IP 代理池从「仅能增删改查 + 手动分配」升级为**具备主动健康检查、失败累计自动剔除、轮询批量分配**的完整代理管理能力。此前加完代理只能等真实请求才知道是否可用，代理失效也不会被记录或自动禁用，且只能逐个手动分配给凭据。
+
+### ✨ 新功能 — 主动健康检查与连通性测试
+
+- **探测连通性与延迟**：`ProxyEntry` 新增 `health / latencyMs / lastCheckedAt / consecutiveFailures / autoDisabled` 字段（`serde(default)` 向后兼容旧 `proxy_pool.json`）。通过该代理请求轻量公网端点 `https://www.gstatic.com/generate_204`（8s 超时）验证「能否走通 + 往返延迟」，不依赖上游 Kiro。
+- **后台健康检查调度器**：照搬 `start_balance_refresher` 模式新增 `start_proxy_health_checker`，每 5 分钟对所有已启用代理用 `join_all` 并发探测一次。
+- **新接口 `POST /proxy-pool/{id}/check` 与 `/proxy-pool/check-all`**：分别供 UI「测试」按钮即时探测单个代理、以及手动触发全量健康检查。
+
+### ✨ 新功能 — 失败累计与自动剔除
+
+- **连续探测失败自动禁用**：探测失败累计 `consecutive_failures`，达阈值（3 次，与凭据 `MAX_FAILURES_PER_CREDENTIAL` 对齐）即自动 `enabled=false, auto_disabled=true`；探测成功立即清零。用户手动重新启用时清除自动禁用标记与失败计数。仅由健康检查触发，不侵入 `provider.rs` 请求热路径。
+
+### ✨ 新功能 — 轮询批量分配
+
+- **新接口 `POST /proxy-pool/assign-round-robin`**：取「已启用且非 Unhealthy」的可用代理，对目标凭据（默认全部）按取模轮询写入 `proxy_url`，复用 `token_manager.update_credential`，免去逐个手动分配。
+
+### ⚡ 优化 — HTTP Client 缓存
+
+- **缓存容量上限淘汰**：`provider.rs` 的 `client_cache` 原为无界 `HashMap`，代理数增长会令每个代理常驻一个 `reqwest::Client` 导致内存无界增长。改为带容量上限（64）的 `ClientCache`，按插入顺序淘汰最旧的非全局代理 client，全局代理 client 常驻不被淘汰。
+
+### 🎨 前端
+
+- 代理池弹窗每行新增健康状态徽章（绿：可用 + 延迟 ms / 红：异常 + 连续失败次数 / 灰：未检测）与最近检测时间，并区分「自动禁用」与用户「手动禁用」。
+- 每行新增「测试」按钮，顶部新增「全部检测」「轮询分配」按钮。
+
+## [0.5.7] - 2026-05-30
+
+主题：凭据失败次数从单一"连续失败计数器"升级为**累计统计 + 按类型三色分类展示**。此前卡片"失败次数"绑定 `failure_count`（连续失败计数器，成功即清零、账号风控与瞬态不计入），导致鉴权失败被其他凭据救回后立即清零、账号风控压根不显示，与用户对"这个凭据到底失败了多少次、什么原因"的直觉不符。
+
+### ✨ 新功能 — 累计失败统计
+
+- **拆分计数,避免误禁用**：`token_manager` 新增 `total_failure_count`——所有失败类型（鉴权 / 额度 / 风控 / 瞬态 / 网络）都 +1、只增不减、仅手动「重置失败计数 / 恢复异常」(`reset_and_enable`) 时归零。原 `failure_count` 保持"连续失败、成功清零"语义,继续驱动"连续失败 N 次自动禁用",因此健康凭据不会被终身累计的失败数误禁用。持久化到 `kiro_stats.json`（`serde(default)` 向后兼容旧文件）,贯通快照 → admin API → 前端。
+
+### ✨ 新功能 — 失败次数按类型三色分类
+
+- **三色展示（鉴权 / 风控 / 其他）**：卡片"失败次数"改为 `auth / throttle / other` 三个分色数字（如 `3/1/2`,鉴权红、账号风控橙、其他灰）。数据来自 trace 库聚合——新增 `trace_db::failure_stats()` 对 `trace_attempts` 按 `credential_id + outcome` 分组 COUNT 并归并三类（鉴权=`auth_failed`、风控=`account_throttled`、其他=额度/瞬态/网络/请求错误/未知）。
+- **新接口 `GET /api/admin/traces/failure-stats`**：返回 `{credentialId: {auth, throttle, other}}`。前端 dashboard 每 30s 拉一次并按凭据分发给各卡片;无 trace 数据（trace 关闭 / 已过期清理）时回退显示 `totalFailureCount`。鼠标悬停 title 说明各类含义,点击仍打开失败日志详情弹框。
+
+## [0.5.6] - 2026-05-30
+
+维护版本：仅版本号递增，无功能或代码变更（内容同 0.5.5）。用于刷新发布产物 / 镜像。
+
+## [0.5.5] - 2026-05-30
+
+主题：新增**请求链路追踪（Trace）+ 「请求日志」排查页面**。此前 `/v1/messages` 的失败链路几乎不可观测——provider 重试循环里每跳失败（402 禁用 / 429 风控冷却 / 401/403 鉴权 / 5xx / 网络错误）只有 `tracing::warn!` 日志，handler 最终只写一条 `UsageRecord` 且失败时 `credential_id=0`、status 仅 success/error，无错误类型、无重试次数、无上游错误体；流式中途断开也只记 `error`。这一版把每个外部请求的完整重试链路（含每跳命中凭据、HTTP 状态码、失败分类、上游错误体片段、耗时）落到 SQLite，并提供可筛选、可展开链路的前端页面，专门用于排查"中断"类问题。配套加日志治理（trace 开关 / 保留天数可配且运行时可改），以及一批凭据卡片交互改进（拖拽排序优先级、失败日志详情弹框、卡片等高对齐等）、Kiro 账号无痕登录选项。
+
+> 0.5.3 / 0.5.4 因发布间隔过短被合并进 0.5.5，请直接使用 0.5.5。下方为合并后的完整内容。
+
+### ✨ 新功能 — Kiro 账号无痕登录
+
+- **「使用无痕窗口登录」选项**：Social 登录对话框新增勾选框。勾选后发起登录不自动 `window.open`（浏览器不允许网页 JS 直控无痕模式，远程部署后端也无法拉起访客本地浏览器），改为把登录链接复制到剪贴板并提示用户自行用无痕 / 隐身窗口（Ctrl+Shift+N）打开，避免与当前已登录的 Google / GitHub 账号串号；waiting 界面提供「复制登录链接」按钮可重复复制。不勾选维持原自动打开行为。
+
+### 🛠 修复 — 凭据失败详情查询与展示
+
+- **失败记录覆盖"中间跳失败但整体成功"**：此前凭据失败详情弹框用 `credentialId`（最终凭据）+ `onlyFailed`（最终状态）过滤，导致"某凭据某一跳失败、但请求最终被其他凭据救回成功"的记录查不到——而这正是凭据因失败过多被禁用的典型成因。`TraceQuery` 新增 `failed_attempt_credential_id`，用 `EXISTS` 子查询匹配 `trace_attempts` 里该凭据 `outcome != 'success'` 的跳（不论 trace 最终状态）；`GET /api/admin/traces` 新增 `failedAttemptCredentialId` 参数。前端弹框改用该维度查询。
+- **失败次数与日志条数一致**：弹框原按 trace 渲染、每条只取该凭据第一个失败跳，导致同一请求里该凭据连续失败多跳被折叠成一行（如 3 次 403 只显示 1 条）。改为摊平该凭据的所有失败跳逐条展示，每行标注「第 N/M 跳」，单跳只显示本跳的 outcome / HTTP / 错误体；整条 trace 最终成功时标注"本次请求最终由其他凭据成功"。
+
+### ✨ 新功能 — 请求链路追踪（尝试级）
+
+- **SQLite 持久化**：新增 `src/admin/trace_db.rs`（rusqlite + bundled，自带 SQLite 源码静态编译，无系统库依赖）。`traces.db` 与凭据文件同目录，WAL 模式。两张表：`traces`（请求级汇总）+ `trace_attempts`（每跳明细，外键 trace_id）。一个外部请求 = 1 条 trace + N 条 attempt。
+- **每跳结构化记录**：provider 重试循环（`src/kiro/provider.rs`）每一跳结束时通过 `TraceSink` 上报：第几次尝试、命中凭据 id、endpoint、HTTP 状态码（网络层失败为 null）、失败分类、上游错误体片段（截断 2KB）、单跳耗时。失败分类复用现有判别：`quota_exhausted` / `account_throttled` / `auth_failed` / `transient` / `network_error` / `bad_request` / `unknown` / `success`。
+- **请求级汇总**：handler 层 `RequestTracer`（`src/anthropic/handlers.rs`）累积 attempts，请求结束时 finalize：`final_status`（success / error / interrupted）、`final_credential_id`、顶层 `error_type`（提升自最后一跳分类，便于筛选）、`error_message`、总尝试次数、端到端耗时。
+- **流式中断检测**：流式 / 缓冲流式两路的 SSE unfold 都累计已发送字节数，上游中途断流时标记 `final_status=interrupted` + `interrupted_after_bytes`，区分"完整失败"与"半截中断"。
+- **保留期可配**：后台任务（复用现有 cleanup tokio 循环）每天 `DELETE` 掉超过保留天数的 traces + 关联 attempts，保留天数默认 7 天、运行时可改（见下方"日志治理"）。`traces.db` 打开失败不致命——降级为内存库，trace 不可用但服务正常。
+- **零侵入**：`KiroCallResult` 签名不变，attempt 走 `TraceSink` 旁路上报；未启用 trace（开关关闭或 store 为 None）时所有路径零开销。MCP（WebSearch）路径本期不接 trace。
+
+### ✨ 新功能 — Admin API + 「请求日志」页面
+
+- **`GET /api/admin/traces`**：query 参数 `status` / `errorType` / `credentialId` / `model` / `onlyFailed` / `limit`（默认 200，上限 1000），动态拼参数化 WHERE + `ORDER BY ts_epoch DESC LIMIT`，返回含每跳明细的链路；附带 credential email 反查（与 `stats_by_credential` 一致）。
+- **前端独立「请求日志」Tab**（`admin-ui/src/components/trace-log-page.tsx`）：与概览 / 凭据管理 / 客户端 Key 并列。表格列：时间、模型、状态徽章（成功绿 / 失败红 / 中断橙）、最终凭据（email）、错误类型、重试次数、耗时。顶部筛选：状态下拉 + 错误类型下拉 + "只看失败"开关 + 刷新。点击行展开完整重试链路时间线，每跳显示凭据 / endpoint / HTTP 状态 / outcome 徽章 / 耗时，失败跳展示上游错误体片段（等宽可折叠）。
+- **新增前端文件**：`api/traces.ts`、`hooks/use-traces.ts`（复刻 stats 的 30s 刷新 + keepPreviousData）、类型 `TraceAttempt` / `TraceRecord` / `TraceQuery`。
+
+### ✨ 新功能 — 日志治理（可配置 + 运行时可改）
+
+- **三个 config 字段**（`src/model/config.rs`，camelCase）：`traceEnabled`（默认 true）/ `traceRetentionDays`（默认 7）/ `usageLogRetentionDays`（默认 31）。启动时读入，分别初始化 `TraceStore` 与 `UsageRecorder`。`config.example.json` 已补充示例。
+- **运行时可改 + 持久化**：保留期与 trace 开关改为 `AtomicBool` / `AtomicU64`（参照 `account_throttle` 的运行时可变模式）。`GET/PUT /api/admin/config/log-governance` 改完立即生效并回写 `config.json`，无需重启；保留天数校验 `1..=365`，写盘失败时运行时值仍生效并 warn。关闭 `traceEnabled` 后 `TraceStore::insert` 直接短路，不再写新链路（历史记录仍可查）。
+- **前端治理面板**：「请求日志」页筛选栏新增"治理设置"下拉（参照顶栏风控配置）——trace 启用开关 + trace 保留天数输入 + usage 日志保留天数输入，保存即调 `PUT /config/log-governance`。
+
+### ✨ 新功能 — 凭据卡片交互改进
+
+- **拖拽排序优先级**（`@dnd-kit`）：每张凭据卡片操作区新增 `⋮⋮` 拖拽手柄，按住手柄即可在当前页内拖动重排。松手后按新视觉顺序赋连续递增的 `priority`（全局位置 = 页起始索引 + 页内序号），只对实际变化的卡片发 `set_priority`，乐观更新 + 失败回滚。手柄带 `data-no-rect-select`，与既有矩形框选 / 点击选中完全隔离；拖拽中关掉 Card 的 `transition-all` 与 hover 位移，保证"跟手"。**移除原优先级 ↑/↓ 按钮**，操作区恢复单行。仅当前页内排序，翻页清除本地顺序覆盖。
+- **失败日志详情弹框**：卡片"失败次数"改为可点击，弹框（`credential-failures-dialog.tsx`）展示该凭据最近 50 条失败链路（复用 `GET /traces?credentialId=X&onlyFailed=true`，懒加载——弹框未打开不查询）。每条含时间、错误类型徽章、HTTP 状态、错误消息、上游错误体片段。补足了卡面"失败次数"计数器看不到的瞬态 / 网络失败历史（该计数器是连续失败计数、成功即清零、瞬态错误故意不计入，语义不变）。
+- **可交互数值统一标识**：优先级（`Pencil` 编辑）/ 失败次数（`ScrollText` 看日志）/ 成功次数（`RotateCcw` 重置）三个可点击数值统一加图标 + `hover:bg-accent` 悬停反馈 + `cursor-pointer`，此前无可点击标识。
+- **启用凭据后自动刷新余额**：在卡片开关把凭据从禁用切到启用且成功后，自动触发一次该卡片的余额查询。
+- **卡片等高对齐**：Card 改 `flex h-full flex-col` 填满 grid 行高、CardContent `flex-1`、操作区 `mt-auto` 固定贴底；余额面板加 `min-h-[150px]`，未查询 / 查询中 / 已查询三态高度一致。同行卡片整体对齐。
+- **徽章合并减少换行**：标题下的配置元信息徽章（endpoint / Profile ARN）合并为单个 `endpoint · ARN` 徽章；状态类徽章（订阅 / 活跃 / 已禁用 / 已超额 / 冷却）保留独立以维持颜色语义。
+
+### 📦 依赖 / 构建
+
+- **新增 Rust 依赖**：`rusqlite = { version = "0.32", features = ["bundled"] }`。bundled 自带 SQLite C 源码静态编译，跨平台一致、无需系统库。
+- **新增前端依赖**：`@dnd-kit/core` / `@dnd-kit/sortable` / `@dnd-kit/utilities`（凭据卡片拖拽排序，vendor chunk 约 +42KB / gzip +14KB）。
+- **`.gitignore` / `.dockerignore`** 新增 `traces.db` 及 WAL 边车文件（`traces.db-shm` / `traces.db-wal`，运行时产物不入库）。
+- **测试覆盖**：247 通过（trace_db 新增 5：insert/query roundtrip、disabled 短路、only_failed/status/model 筛选、cleanup 按保留期、错误体截断）。
+
+### 📦 升级指南
+
+1. **`docker compose pull && docker compose up -d`** 即可。`traces.db` 首次请求时自动创建于凭据文件同目录，无需手动初始化。
+2. **排查中断**：登录管理面板 → 顶栏「请求日志」Tab → 用状态 / 错误类型筛选或开"只看失败" → 点击任一行展开看完整重试链路（哪个凭据、第几跳、因为什么失败、上游原始错误体）。
+3. **日志治理**：「请求日志」页"治理设置"下拉可随时开关 trace、调整 trace / usage 日志保留天数，改完立即生效并写回 `config.json`；也可直接在 `config.json` 配 `traceEnabled` / `traceRetentionDays` / `usageLogRetentionDays`（缺省即用默认 true / 7 / 31）。
+4. **凭据排序与失败排查**：「凭据管理」Tab 拖动卡片 `⋮⋮` 手柄即可在当前页内调整优先级（实时持久化）；点击卡片"失败次数"可看该凭据的失败日志详情（依赖 trace 开启）。
+5. **无破坏性变更**：trace 与现有 usage_log / 概览统计完全独立，不影响既有功能；升级无需清理任何状态文件。
+
+## [0.5.2] - 2026-05-29
+
+主题：在 0.5.1（prompt cache 重构 + Credit 全链路 + 仪表盘改造）基础上加入**账号级风控识别与冷却失败转移**——上游 Kiro/Q-Developer 在风控触发时返回带 `suspicious-activity` body 的 429，与"高负载 429"完全不同；旧版本一刀切当成 transient 重试，导致单账号被反复打到。同时修复 thinking 模式跨轮 replay 的客户端校验失败。前端配套加风控冷却倒计时徽章、单卡刷新余额按钮、整页刷余额按钮提级、趋势图 range 切换动效等若干细节。
+
+> 0.5.0 因 Credit 数值显示问题被作废、0.5.1 在小流量场景下仍有单账号被打死风险，**0.5.2 整合三个版本所有内容，请直接升级到 0.5.2，跳过 0.5.0 / 0.5.1**。下方按特性分块罗列从 0.4.x 升上来需要知道的所有变更（标注「0.5.2 新增」的小节是相对 0.5.1 的增量，其余为 0.5.1 内容继承）。
+
+### ✨ 新功能 — 账号级风控识别与冷却失败转移（0.5.2 新增）
+
+- **`is_account_throttled` 端点判别器**：新增 `src/kiro/endpoint/mod.rs::is_account_throttled`，匹配 `429` + body 含 `suspicious-activity`（Kiro/Q-Developer 在账号触发风控时下发的标志）。同步扩展 `is_monthly_request_limit` 也匹配 `OVERAGE_REQUEST_LIMIT_EXCEEDED`，把"超额请求次数耗尽"识别为月度配额耗尽并下线该凭据。
+- **provider 拆分 429 路径**：`src/kiro/provider.rs` 把原本一刀切的 429 处理改成两路——账号风控走"放入冷却 + 失败转移到下一凭据"，high-traffic 429 仍走 transient 重试。冷却中的凭据在 `select_credential` / `available_count` / `snapshot` 全部跳过，调度器不会反复打到同一个被风控的账号。
+- **`TokenEntry::throttled_until` 字段**：`token_manager.rs` 给每条凭据加 `throttled_until: Option<Instant>`，并在 `MultiTokenManager` 暴露 `mark_account_throttled(id, secs)` / `clear_throttle(id)` 两个 API。
+- **`account_throttle_failover` / `accountThrottleCooldownSecs` 配置**：两个原子可在运行时切换，无需重启；持久化到 `config.json`。冷却时长默认 600s（10 分钟），可在面板自定义分钟数。
+- **Admin API 三件套**：
+  - `GET /api/admin/config/account-throttle` 读取当前开关 + 冷却秒数
+  - `PUT /api/admin/config/account-throttle` 修改并落盘
+  - `POST /api/admin/credentials/:id/clear-throttle` 手动解除单条凭据冷却
+- **凭据快照 `throttled_remaining_secs` 字段**：`CredentialStatus` 新增剩余秒数字段，前端按秒递减渲染倒计时。
+- **前端 UI**：
+  - 顶栏「设置」下拉新增"账号风控失败转移"开关 + 冷却预设按钮（5 / 10 / 30 / 60 分钟）+ 自定义分钟输入。
+  - 凭据卡片在风控冷却中：橙红描边 + `mm:ss` 倒计时徽章（`Clock` 图标），到期或手动解除后自动恢复调度。倒计时本地用 `setInterval` 自然递减，避免 30s 拉取间隔之间数字停顿。
+  - 卡片"更多操作"菜单冷却中显示"解除风控冷却（mm:ss）"项。
+
+### 🛠 修复 — Thinking 模式跨轮 replay 兼容（0.5.2 新增）
+
+- **thinking block 必带 `signature`**：Claude Code、Anthropic SDK 等思考模式客户端会拒绝下一轮请求中 `assistant.content[].thinking` 缺 `signature` 的消息，抛 `The content[].thinking in the thinking mode must be passed back to the API`。Kiro 上游不是 Anthropic API、永不下发真签名。修复方案：流式与非流式两路都在思考块结束前注入稳定的占位符 signature，使客户端校验通过；converter 在请求转发时只读 `block.thinking` 文本字段，占位符对上游完全不可见。
+  - 流式：每个 thinking block 的 `content_block_stop` 之前发出一个 `signature_delta` 事件（4 条收尾路径全部覆盖：正常 stop、tool_use、客户端中断、错误）。
+  - 非流式：`assemble_response` 在组装 thinking content block 时直接带上 `signature` 字段。
+  - 测试：新增"signature_delta 必须先于 content_block_stop 且非空"断言（242 通过，+1）。
+
+### ✨ 新功能 — 凭据管理体验改进（0.5.2 新增）
+
+- **每张凭据卡片单独「刷新余额」按钮**：放在「刷新 Token」旁，单 GET `/api/admin/credentials/:id/balance`，loading 时按钮 spin 不阻塞其他卡片。原来只能整页批量"查询当前页信息"才能看到单条凭据的余额。
+- **整页余额刷新按钮提升到工具栏**：之前藏在「更多操作」下拉里，新版作为独立 outline 按钮放到工具栏右侧（"添加凭据"前），并带 `刷新中… N/M` 进度。
+- **「一键开启超额」拆分两态**：之前一个按钮根据可开启数 / 待确定数文案切换，且会对待确定凭据直接调写接口（FREE 订阅 403）。现在拆成两个独立路径：
+  - 有可开启凭据 → 调写接口 `setUserPreference`，文案 `一键开启超额（N）`。
+  - 全部凭据状态待确定 → 改走只读批量查余额，文案 `重试拉取超额状态（N）`，附 `刷新中… N/M` 进度，绝不触发写接口。
+- **趋势图 range 切换动效**：`OverviewPage` 给 `<TimeSeriesChart>` 包一层 `key={range}` 强制重挂，外加 `chart-range-fade` CSS 动画（`opacity + translateY`，`prefers-reduced-motion` 自动禁用）。Recharts 折线动画 `isAnimationActive=true / 550ms ease-out` 同步打开，按下 24h / 7d / 30d 切换器有"刷新"反馈。
+- **字体栈切换到 Plus Jakarta Sans + JetBrains Mono**：`index.html` 通过 Google Fonts `preconnect` 预连 + `display=swap` 异步加载（300/400/500/600/700/800 + Mono 400/500），`tailwind.config.js` 把 `font-sans` 首位换成 `Plus Jakarta Sans`、新增 `font-mono` 栈以 `JetBrains Mono` 为先。中文回落 `PingFang SC / Hiragino Sans GB / 微软雅黑` 不变；移除原本永远不命中的 `SF Pro Display/Text` 与 `Helvetica Neue`。`display=swap` 确保字体未到达时先用回落字体渲染、不阻塞首屏。
+
+## [0.5.1] - 2026-05-29 *(superseded by 0.5.2)*
+
+> **此版本已被 0.5.2 整合并取代**——0.5.1 在小流量场景下仍存在单账号被打死的风险（账号风控 429 当 transient 重试），0.5.2 修复并整合所有功能。请直接升级到 0.5.2，跳过 0.5.1。
+
+下方为 0.5.1 的原始内容，保留以便追溯。
+
+### 💥 Breaking — 基础设施
+
+- **彻底移除 Redis 依赖**：`anthropic/cache.rs` 整模块删除（约 740 行），`Cargo.toml` 删 `redis` crate，`docker-compose.yml` 删 `redis` 服务、`depends_on`、`redis-data` 命名卷，`config.example.json` 删 `redisUrl` / `cacheDebugLogging` / `cacheMaxReadRatio`，对应的 `Config::redis_url` / `cache_debug_logging` / `cache_max_read_ratio` 字段也删。已有部署里这三个配置字段会被忽略；不会破坏功能（只是无法识别），但**升级前请把它们从 `data/config.json` 删掉以免日后误以为还在生效**。
+- **API 响应字段含义变化**：`/v1/messages` 响应里的 `usage.cache_creation_input_tokens` / `cache_read_input_tokens` 不再是「Redis 缓存」（已下线）也不是「Anthropic 上游缓存」（实测上游不下发），而是**中转层自己根据请求体 `cache_control` 断点产出的提示词缓存计数**。详见下方"中转层 Prompt Cache"章节。
+- **`UsageRecordHook::record` 签名加 `credits: f64` 参数**；`ClientKeyManager::record_usage` 同步加。下游若 fork 了 handler 调用链需要补一个参数。
+
+### ✨ 新功能 — 中转层 Prompt Cache（无外部依赖）
+
+- **进程内提示词缓存**：新模块 `src/anthropic/prompt_cache.rs`。按 Anthropic 协议把请求体里 `cache_control` 断点（最多 4 个，分布于 `tools` / `system` / `messages[].content`）切成一组前缀段，对每段累加 SHA-256 哈希作为 key，TTL 默认 5 分钟、`cache_control.ttl="1h"` 解析为 1 小时。
+  - **命中规则**：取最深命中段索引 `i*` → `cache_read = segments[i*].cumulative_tokens`，`cache_creation = total - segments[i*].cumulative_tokens`；全部 miss 时 `cache_creation = total`、`cache_read = 0`。每次请求结束时把所有段（命中 / 未命中）写回，刷新 LRU `last_hit_at` 与 TTL。
+  - **持久化**：cache_dir 下 `prompt_cache.json`（按字节哈希 → `{tokens, expires_at, last_hit_at}`），后台 60s 一次 flush（仅 dirty 时落盘），启动时过滤过期条目重建。LRU 上限 4096 条。
+- **流式 / 非流式两路接线**：`StreamContext` / `BufferedStreamContext` 新增 `set_initial_cache_tokens(cc, cr)`。`message_start` / `message_delta.usage` 与非流响应的 `usage.cache_creation_input_tokens` / `cache_read_input_tokens` 全部由 PromptCache 真实产出，不再硬编码 0。
+- **真实验证**：两次完全相同的 `/v1/messages` 请求（带 `cache_control: ephemeral` 系统提示），第一次 `cache_creation=94 / cache_read=0`，第二次 `cache_creation=0 / cache_read=94`，精确按协议工作。
+- **9 个新单测**覆盖 lookup / record / TTL / LRU / flush + reload / 多断点命中。
+
+### ✨ 新功能 — Credit 计费维度
+
+- **解析上游 meteringEvent**：之前 `Event::Metering` 被丢成 `()`。新模块 `src/kiro/model/events/metering.rs` 严格解析真实 payload `{unit, unitPlural, usage(f64)}`（实测确认上游不下发 token / cache 字段；不做字段名候选 fallback，直接读 `usage`）。
+- **Credit 全链路**：`UsageRecord` / `BucketStats` / `TimeSeriesPoint` / `OverviewStats` / `ClientKey` 全部新增 `credits` 字段；流式 / 非流式 hook 都把 `credits` 累加并写入。
+- **API 暴露**：`GET /api/admin/stats/overview` 多 `todayCredits` / `weekCredits`；`GET /api/admin/stats/timeseries` 每个时序点多 `credits`。
+- **前端展示**：概览页顶部新增 "近 X Credit" 卡片（grid 由 4 列改为 5 列）；时序图 Tooltip 单独一行展示「本桶 Credit」（量级与 token 差异过大，不画线）。
+
+### ✨ 新功能 — 仪表盘改造
+
+- **Token 使用趋势图重做**（`time-series-chart.tsx`）：5 系列折线（Input / Output / Cache Creation / Cache Read / Cache Hit Rate），双 Y 轴：左轴 token 量级（紧凑 K/M/B），右轴 0–100% 命中率（紫色虚线，刻度固定 [0, 20, 40, 60, 80, 100]）；自定义深色 Tooltip，命中率 = `cacheRead / (input + cacheRead)`。全零数据时左轴强制显示 `0` 刻度，避免空白图表；Legend 改空心圆 + 英文标签。
+- **顶部卡片随时间窗切换**：之前调用 / Token 卡片永远显示「今日」，新增 `useMemo` 把当前 `seriesData` 按 24h / 7d / 30d 聚合，标题动态变成"近 24 小时调用 / 输入 Token"等。`activeClientKeys` 仍是当前活跃数。
+- **数值紧凑格式 K/M/B**：新增 `formatNumber()` 工具（基于 `Intl.NumberFormat` compact notation），覆盖概览卡片 / 模型表 / 凭据柱图 / 时序图 / 凭据列表 Badge。`formatCredits()` 对 credit 浮点专用：`≤ 0` → `"0"`、`< 1000` → 3 位小数、`≥ 1000` → K/M/B。Y 轴 / Tooltip / 表格全走同一格式器。
+- **凭据柱图按 email 显示**：之前 X 轴 label 是 `#id`（email 字段始终空），后端 `stats_by_credential` 在 handler 拼装时已经反查注入了 `email`，前端改为以 email 为主、`#id` 兜底；过长 email 截断到 22 字符（保留 @domain），完整 email 在 Tooltip 显示。
+
+### ✨ 新功能 — KAM 凭据导出
+
+- **新端点 `GET /api/admin/credentials/export?ids=...`**：导出选中凭据为 KAM 1.8.3+ 平铺 JSON 格式，含 `refreshToken` / `accessToken` / `clientSecret` 等敏感字段。
+- **`MultiTokenManager::clone_all_credentials`** 用于 admin 服务层取完整凭据快照（脱敏由调用方控制）。
+- **新 admin-ui 类型 `KamExportAccount` / `KamExportResponse`**，前端凭据列表批量选择后可一键下载。
+
+### ✨ 新功能 — 体验改进
+
+- **在线更新对话框 Release Notes 支持 Markdown 渲染**：之前折叠面板里的 Changelog 只走 `whitespace-pre-wrap` 渲染原文，标题 / 列表 / 链接全都显示成纯文本。改用项目内自带的轻量 markdown 渲染器（`admin-ui/src/components/markdown.tsx`，~280 行单文件、无外部依赖）：覆盖 `# – ####` 标题、`-/*/+` 与 `1. 2. 3.` 列表、`> 引用`、`---` 分隔线、围栏代码块、行内 `code`、`**加粗**` / `*斜体*` / `[文本](url)`。不引入 markdown-it / remark 等大型依赖，体积可忽略。
+- **KAM 导入支持多文件批量合并**：`KamImportDialog` 文件选择器加 `multiple` 属性，一次可选多个 KAM 导出 JSON；前端把每个文件的 `accounts` 数组合并成一份再走原有解析与预览流程，单文件失败不影响其他文件继续导入；toast 总结展示成功合并的记录数与失败文件名。
+
+### ✨ 新功能 — KAM 导入兼容
+- **兼容 KAM 1.6.9+ 的毫秒时间戳 `expiresAt`**：旧版导出 RFC3339 字符串、新版改为毫秒数字。前端在解析时统一规范化为 ISO 字符串，下游导入逻辑无需关心两种格式。
+- **打开对话框自动触发文件选择器**：减少一次点击，用户打开 KAM 导入对话框后直接进入选文件流程。
+
+### 🛠 修复
+
+- **Credit 数值小数位失控（0.5.0 → 0.5.1）**：`formatCredits()` 中 `value ≥ 1` 的分支会回退到 `formatNumber`，而 `formatNumber` 对 `< 1000` 的数直接 `String(value)`，导致 `1.5755479141293534` 这类长浮点被原样打印。修复后统一规则：
+  - `≤ 0 / null / NaN` → `"0"`
+  - `0 < value < 1000` → 保留 3 位小数（`1.576` / `0.017`）
+  - `value ≥ 1000` → `Intl.NumberFormat` compact notation（`1.2K` / `3.4M`）
+- **重启后用量统计丢失**：根因是当 `--credentials credentials.json`（无目录前缀）启动时，`PathBuf::from("credentials.json").parent()` 返回 `Some("")`，导致 `cache_dir = ""`：`UsageRecorder` 把 `usage_log.*.jsonl` 写到 CWD（路径无前缀），`UsageAggregator::rebuild_from_logs("")` 调用 `read_dir("")` 失败，重启后历史记录看似全丢。修复：`MultiTokenManager::cache_dir()` 与 `UsageRecorder::new` / `rebuild_from_logs` 都把空路径归一为 `.`，并把"创建目录失败 / 读取目录失败"由静默 `_` 改成 `tracing::warn!` 显式打印路径。重建完成日志带上目录与条目数。
+- **`StatsResponse` 不再有 `let mut overview = ...` + `let _ = (&mut overview).today_calls;` 这种 dead-code 黑魔法**——直接用不可变 `overview`。
+
+### 🎨 体验
+
+- **API Key 随机生成器收紧**：之前默认 40 字节 base64url，会产生 `sk-admin--Wt2ZN...` 这种双连字符的视觉断裂。改为：字符表只含 `a-zA-Z0-9`（拒绝采样保证均匀），32 字符（~190 bit 熵），按对话框模式选择前缀（admin Key 用 `sk-admin-`，业务 Key 仍用 `sk-kiro-`）。**移除 `Math.random` 弱熵 fallback**，缺 `crypto.getRandomValues` 时直接抛错。
+
+### 📦 依赖 / 构建
+
+- **删除依赖**：Rust 端 `redis = "0.27"`。
+- **前端构建分块**：`recharts` 及其 d3 依赖链单独成块（约 410 KB / gzip 106 KB），仅"概览"路由懒加载触发；`vendor` chunk 从 510 KB 缩到 69 KB；`sonner` 也单独成块；`chunkSizeWarningLimit` 提到 600 KB。
+- **`.gitignore` / `.dockerignore`** 新增 `prompt_cache.json`（运行时落盘，不入库）。
+- **测试覆盖**：单测从 233 增到 237（PromptCache 9 + Metering 2 - 现有路径调整）。
+
+### 📦 升级指南
+
+1. **`docker compose pull && docker compose up -d`** 即可。如果之前部署了 `redis` 服务，可以一并停掉删掉（数据无价值）。
+2. **删除过时配置**：编辑 `data/config.json`，删除 `redisUrl` / `cacheDebugLogging` / `cacheMaxReadRatio` 三个字段（保留也只是被忽略，不会报错）。
+3. **下游客户端**：响应里的 `cache_creation_input_tokens` / `cache_read_input_tokens` 字段含义变了——现在反映的是中转层提示词缓存而非上游缓存。如果下游用这两个字段做计费对账，需要重新理解口径（中转层缓存命中并不会减少上游 credit 消耗，是 SDK 体验优化）。
+4. **历史用量**：`usage_log.*.jsonl` 的旧记录会被自动加载（`credits` 字段缺失时默认 0），重启不丢趋势。新的请求开始会带 credit。
+5. **若你已经升级到 0.5.0**：直接升 0.5.2；不需要清理任何状态文件。
+6. **0.5.2 增量项**：升 0.5.2 后，「账号风控失败转移」默认开启、冷却 600s。如不希望自动冷却（例如只用一两个账号、宁愿等冷却也不想被识别为风控），登录管理面板 → 顶栏「设置」→ 关闭"账号风控失败转移"。Thinking 模式 replay 修复无需手动操作。
+
+## [0.4.0] - 2026-05-22
+
+主题：把 kiro.rs 从「单 Key 的 Anthropic 协议适配器」推进到 Key 分发场景——加入面向下游用户的客户端 Key 分发、按 Key/凭据/模型维度的 Token 用量统计与仪表盘趋势可视化。
+
+### ✨ 新功能 — 客户端 API Key 分发
+
+- **新的两层 Key 模型**：`config.apiKey`（master）保留向后兼容，新增 `csk_*` 客户端 Key 层。每把 Key 独立启用/禁用、独立计数，泄露后只需替换一把而非全员换 master。
+  - 持久化到 `client_api_keys.json`（与 `credentials.json` 同目录），无 SQLite 依赖
+  - `subtle::ConstantTimeEq` 全表常量时间比对，防 HashMap 短路引发的时序攻击
+  - 鉴权顺序：master apiKey → 客户端 Key；命中后通过 `Extension(KeyContext { key_id })` 注入下游 handler
+- **Admin API**：6 个新端点
+  - `GET /api/admin/client-keys` 列表（脱敏展示 `csk_abcd...mnop`）
+  - `POST /api/admin/client-keys` 创建（响应里返回明文 key，**仅此一次**）
+  - `PUT /api/admin/client-keys/:id` 改名 / 改描述
+  - `DELETE /api/admin/client-keys/:id` 删除
+  - `POST /api/admin/client-keys/:id/disabled` 启用/禁用
+  - `POST /api/admin/client-keys/:id/reset-stats` 重置累计计数
+- **新前端 Tab「客户端 Key」**：表格展示名称、脱敏 Key、状态、总调用、总输入/输出 Token、最后使用时间、操作按钮；新建后弹出明文一次性展示对话框（带显示/隐藏切换、复制按钮）。
+
+### ✨ 新功能 — Token 用量统计与仪表盘
+
+- **请求级用量记录**：`/v1/messages` 流式 / 缓冲流式 / 非流式三条路径在结束（含错误）时统一写入用量。`KiroProvider` 改造返回 `KiroCallResult { response, credential_id }`，把命中凭据 ID 透传到 handler 用于按上游凭据维度聚合。
+- **JSONL 持久化 + 内存聚合**：
+  - `usage_log.YYYY-MM-DD.jsonl` 按日滚动，单行一条记录（ts/keyId/credentialId/model/inputTokens/outputTokens/cacheCreation/cacheRead/durationMs/status）
+  - `UsageAggregator` 维护 168 小时桶 + 31 天桶的 ring buffer，启动时从历史 JSONL 重建，重启不丢趋势
+  - 后台任务每 24 小时清理超过 31 天的旧日志
+- **统计 API**：4 个新端点
+  - `GET /api/admin/stats/overview` — 今日 / 最近 7 天的调用次数、Token、错误数 + 活跃 Key/凭据数
+  - `GET /api/admin/stats/timeseries?range=24h|7d|30d` — 按桶聚合的时序点
+  - `GET /api/admin/stats/by-model?range=...` — 各模型的 calls / input / output 排行
+  - `GET /api/admin/stats/by-credential?range=...` — 各上游凭据贡献，附 email
+- **新前端 Tab「概览」**：4 张统计卡片 + 三类图表
+  - 时间 × Token 折线图（input/output/cacheRead/cacheCreation 四条线）
+  - 按模型分布饼图 + 详情表
+  - 按上游凭据堆叠柱图（Top 12）
+  - 右上 24h / 7d / 30d 切换器
+- **客户端 Key 维度的累计**：成功请求会同时把 input/output/cacheCreation/cacheRead 累加到对应客户端 Key 的总数，列表页直接看到每把 Key 的总消耗。
+
+### 🎨 界面 — 多 Tab 导航 + 顶栏统一
+
+- **从单 Dashboard 改为三 Tab SPA**：概览（默认）/ 凭据管理 / 客户端 Key。`App.tsx` 顶栏内置 Tab，URL hash（`#/overview` / `#/credentials` / `#/keys`）同步，未引入 react-router。
+- **`TopbarTools` 工具组件**：把"负载均衡切换 / 刷新 / 在线更新 / 设置（含 Key 修改对话框）"从凭据管理 Tab 抽到 App 顶栏，三个 Tab 都可访问；刷新按钮一次性失效凭据 / 客户端 Key / stats 三类查询。
+- **响应式 Tab 行**：桌面端 Tab 在 logo 旁，移动端折到顶栏第二行。
+- **Dashboard 嵌入模式**：新增 `embedded` prop，在 Tab 内渲染时隐藏自带顶栏、跳过外层 padding，避免与 App 顶栏重复。
+
+### 🛠 性能 / 体验
+
+- **图表渲染优化**：三个 chart 全部 `React.memo` + `useMemo` 稳定 props 引用，关闭 recharts 默认 1.5s 入场动画；时序图根据点数自动稀疏 X 轴 ticks（≤12 全显，≤48 取 12 个，更长取 16 个）避免标签重叠引发的反复布局测量。
+- **数据查询节流**：所有 stats hook 加 `staleTime: 25s`（30s refetchInterval 之内切 Tab 不重复请求）+ `placeholderData: keepPreviousData`（切 range 期间复用旧数据避免 chart 卸载重挂）+ `refetchOnWindowFocus: false`（避免窗口聚焦同时打 4 个请求）。
+- **图表 Tooltip 暗色主题**：抽出 `tooltip-style.ts` 共享样式，`labelStyle` / `itemStyle` 单独设白色——recharts 不让 label/item 继承 `contentStyle.color`，这是之前看不清的根因。
+- **柱图布局修复**：图例从底部移到右上，X 轴 `height: 56` + bottom margin `48`，避免「输入/输出」图例覆盖倾斜的 X 轴标签。
+
+### 📦 依赖 / 构建
+
+- **新增前端依赖**：`recharts ^2.15`（仪表盘图表，~95KB gzip）。
+- **`.gitignore` 新增 4 类条目**：`client_api_keys.json`（含明文 csk）、`usage_log.*.jsonl`、`usage_stats.json`、`*.staged-*` / `*.backup`（在线更新产物）。
+
+### 📦 升级指南
+
+1. **现有部署直接 `docker compose pull && docker compose up -d`**，旧 master `apiKey` 完全兼容，所有现有客户端无需改动。
+2. **想用客户端 Key 分发**：登录 Admin 面板 → 切到「客户端 Key」Tab → 新建 → 把弹窗里的明文 `csk_xxx` 给下游用户，让客户端把它放进 `x-api-key` 或 `Authorization: Bearer` 头。
+3. **想看仪表盘**：`/admin` → 概览 Tab，新部署默认无历史数据，发起几次请求即可看到趋势开始填充。
+4. **历史日志**：服务启动时自动从 `usage_log.*.jsonl` 重建近 31 天聚合，无需迁移脚本。
+
+## [0.3.2] - 2026-05-22
+
+主题：把在线更新对话框打磨成可日常使用的工具——加入 GitHub Token 配置消除限流问题，加入版本验证防止重复更新，加入 staged 复用让两步操作变成无缝衔接，并清理视觉噪音。
+
+### ✨ 新功能
+
+- **GitHub Token 配置**：在线更新对话框新增 GitHub Personal Access Token 输入区，保存后所有 GitHub API 调用都会带上 `Authorization: Bearer <token>`，把限流从匿名 60/小时 提升到认证 5000/小时。匿名访问触发 `403 API rate limit exceeded` 时不再无解。
+  - 配置文件新增 `githubToken` 字段（顶层）
+  - Admin API：`GET /api/admin/config/update` 返回 `githubTokenSet: bool`（不回明文，避免泄露），`PUT /api/admin/config/update` 接受 `githubToken: string`（空字符串表示清除）
+- **Token 验证 + 限流可视化**：新增 `POST /api/admin/system/update/rate-limit` 端点，调用 GitHub `/rate_limit` 实时返回当前限额状态。该 GitHub 端点本身不消耗任何配额，可放心反复调用。
+  - 前端在 token 输入框旁加「验证」按钮：保存前用输入的 token 试一次，避免保存了无效 token
+  - 对话框打开时自动用已保存 token 查一次限额，展示「已认证 / 匿名」徽章、`@username`、`已用 N/上限`、进度条、重置时间
+  - 剩余次数低于上限 5% 时进度条变 amber 提醒
+- **「上次更新于」时间戳**：apply 成功后记录 RFC3339 时间到 `updateLastAppliedAt` 字段，对话框展示「上次更新于：YYYY-MM-DD HH:MM:SS」（本地时区）。回退时清空。
+
+### 🛠 体验优化
+
+- **拉取镜像 → 更新并重启 复用 staged**：「拉取镜像」按钮不再是死功能。下载产物保存到 `<exe>.staged-<version>`，「更新并重启」检测到同版本 staged 时直接 install + exit，跳过重复下载。两步操作之间几乎无感知延迟。
+- **当前已是最新版本时禁用「更新并重启」**：避免对相同版本做无意义的下载-替换-重启。后端在 `apply_image_update` 入口加版本检查，前端按钮根据 `hasUpdate` 同步禁用，鼠标悬停显示原因。
+- **GitHub Token Scopes 不再展示**：原本会把 token 的 OAuth scopes 列出来（如 `admin:org, repo, ...`），是不必要的权限信息泄露。后端不再读取 `X-OAuth-Scopes` header，前端不再显示 Scopes 行。
+
+### 🎨 界面调整
+
+- **更新对话框扁平化**：移除外层卡片包装与 4 层嵌套边框，三个分区改为 `<section>` + `border-t pt-4` 顶分隔线。
+- **取消「有更新」时整块变黄**：原本有更新时整个面板背景变 amber，已经有绿色「可更新」徽章传达同样信息。现在面板始终是中性背景，只保留徽章。
+- **限流摘要卡内嵌**：限流状态展示不再是独立带边框的卡片，而是直接平铺在 GitHub Token 区下方，仅用图标颜色（绿/红）和进度条颜色（绿/黄）区分状态。
+
+## [0.3.1] - 2026-05-22
+
+### ⚠️ 不兼容变更（Breaking changes）
+
+- **配置字段清理**：`config.json` 删除 `updateImage` 与 `updatePreviousImage` 字段，新增 `updatePreviousVersion`。`updateImage` 在新方案里没有意义（在线更新已不再操作 docker 镜像），保留只会误导。已存在的 `updateImage` 字段会被静默忽略。
+- **Admin API 响应字段调整**：`GET /api/admin/config/update` 返回值移除 `image`，把 `previousImage` 改为 `previousVersion`；`PUT /api/admin/config/update` 不再接受 `image` 参数；`POST /api/admin/system/update/{pull,apply,rollback}` 响应移除 `image` 字段。前端已同步更新。
+- **`docker-compose.yml` 移除 docker socket 与 compose 文件挂载**：在线更新不再需要这两个挂载点。继续使用旧 compose 文件部署也能跑通，但会带着不必要的安全风险。
+
+### 🛠 在线更新机制改造
+
+- **从「容器自管自重建」改为「文件级二进制替换」**：`apply_image_update` 不再调用 `docker compose pull/up`，改成下载 GitHub Releases 上对应平台的二进制压缩包，校验 `SHA256SUMS.txt`，原子替换 `<exe>`，旧版本备份为 `<exe>.backup`，最后调用 `std::process::exit(0)` 退出，由 `docker-compose.yml` 里的 `restart: unless-stopped` 接管重启。这样从根本上消除了"网络错误时旧容器被停止、新镜像没拉到、服务挂起"的事故路径。
+- **回退也改为文件级**：`rollback_image_update` 从 `<exe>.backup` 还原可执行文件并退出进程，不再依赖 `kiro-rs:rollback` 镜像 tag，断网也能恢复。
+- **`check_update` 统一走 GitHub Releases API**：取消对 Docker Hub `/v2/repositories/.../tags` 的依赖，单一 endpoint 既拿版本号又拿 changelog，请求次数减半。
+- **移除 docker socket 与 docker CLI 依赖**：`Dockerfile` / `Dockerfile.release` 不再安装 `docker-cli` 与 `docker-cli-compose`；`docker-compose.yml` 删除 `/var/run/docker.sock` 与 `docker-compose.yml` 的挂载。镜像体积更小，容器逃逸面显著缩小。
+- **删除 600+ 行旧逻辑**：`ComposeContext` / `detect_compose_metadata` / `tag_rollback_image` / `validate_image_ref` / `dockerhub_owner_repo` / `DockerHubTagsResponse` 等 docker 相关代码全部移除；`UpdateConfigResponse` / `ImageUpdateResponse` / `SetUpdateConfigRequest` 同步精简。
+- **前端 UI 同步**：「在线更新」对话框移除「镜像」输入框与「保存配置」按钮（这两个控件操作的字段已不存在），保留「拉取镜像」「更新并重启」「回退到上一版本」三大功能按钮的位置、名称、操作流程不变。
+- 配套加 `flate2` / `tar` / `zip` 依赖用于解压 release archive。
+
+### 🚀 CI/CD 加速
+
+- **前端只构建一次**：新增 `build-frontend` job，跑一次 `bun run build` 并把 `admin-ui/dist` 上传为 artifact；后续 7 个二进制矩阵 + 2 个镜像矩阵直接 `download-artifact` 复用，多平台 runner 不再重复装 Bun / 跑 vite。
+- **release profile 调优**：`Cargo.toml` 把 `lto = true`（fat）改为 `lto = "thin"` + `codegen-units = 16`，单作业 `cargo build` 的链接耗时显著下降，对运行时性能影响可忽略。
+- **Docker 镜像复用预编译二进制**：新增 `Dockerfile.release`，CI 里 `build-images` 改为 `needs: build-artifacts`，下载已经构建好的 `Linux-musl-x64` / `Linux-musl-arm64` 二进制后直接 `COPY` 进 alpine，跳过 Dockerfile 内重复的 cargo 编译阶段。开发用 `Dockerfile`、`docker-build.yaml` 仍走完整源码构建。
+- **mold linker（Linux gnu 目标）**：在 `x86_64-unknown-linux-gnu` / `aarch64-unknown-linux-gnu` 矩阵上通过 `rui314/setup-mold@v1` 启用 mold，`RUSTFLAGS=-C link-arg=-fuse-ld=mold`，链接阶段从 5–15s 降至 1–3s。macOS / Windows / musl 目标保持默认链接器以避开兼容性风险。
+- **`cargo build` 全部加 `--locked`**：确保 CI 构建严格按提交的 `Cargo.lock` 解析，避免锁文件漂移导致重复编译。
+
+### 📦 升级指南
+
+1. **保留 docker compose 部署的用户**：直接 `docker compose pull && docker compose up -d` 升到 0.3.1；老 compose 文件里的 `docker.sock` / `docker-compose.yml` 挂载可以从下次 PR 起删掉，不影响功能。
+2. **手动跑二进制的用户**：从 GitHub Releases 下载新版本替换原有二进制即可。
+3. **配置文件清理**：可以从 `data/config.json` 中删除 `updateImage` / `updatePreviousImage` 字段，服务不会再使用它们。
+
+## [0.3.0] - 2026-05-22
+
+### ⚠️ 不兼容变更（Breaking changes）
+
+- 容器发布渠道从 GitHub Container Registry **迁移到 Docker Hub**。
+  - 默认镜像由 `ghcr.io/zyphrzero/kiro-rs:latest` 改为 `zyphrzero/kiro-rs:latest`。
+  - 旧的 GHCR 镜像 **不再发布新版本**；继续使用 GHCR 的部署需要把镜像引用改回 `ghcr.io/...` 自行同步。
+- 配置文件移除以下字段（直接删除即可，迁移逻辑参见下方"在线更新"小节）：
+  - `githubToken`
+  - `updateComposeFile`
+  - `updateService`
+- `docker-compose.yml` 默认镜像同步切换到 Docker Hub。
+
+### 🛠️ 构建工具链升级
+
+- **包管理器迁移到 Bun**
+  - 删除 `pnpm-lock.yaml` / `pnpm-workspace.yaml` / `.npmrc`，新增 `admin-ui/bun.lock` 锁文件。
+  - `package.json` 用 `trustedDependencies` 字段替代 pnpm 的 `onlyBuiltDependencies`，继续放行 `@swc/core`、`esbuild` 的安装脚本。
+  - `Dockerfile` 前端构建阶段改用 `oven/bun:1-alpine`，命令统一为 `bun install --frozen-lockfile --ignore-scripts` + `bun run build`。
+  - GitHub Actions（`build.yaml` / `release.yaml`）用 `oven-sh/setup-bun@v2` 替换 `setup-node` + `pnpm/action-setup`，CI 不再依赖 corepack；bun 版本锁定到 `1.3`，并通过 `actions/cache` 缓存 `~/.bun/install/cache`，多平台矩阵复用同一份依赖缓存。
+  - `README.md` 与 `src/admin_ui/router.rs` 中的 `pnpm` 命令提示同步更新为 `bun`。
+- **前端依赖整体升级到 2026 主版本**
+  - Vite 5 → **8**（Rolldown 引擎，构建时间从约 3.7 s 降到约 0.4 s）。
+  - React 18.3 → **19.2**，类型包 `@types/react` / `@types/react-dom` 同步升到 19.x。
+  - TypeScript 5.6 → **6.0**；移除 TS 6 已弃用的 `tsconfig.json#baseUrl`，仅保留 `paths`（依赖 `moduleResolution: bundler` 解析）。
+  - 前端 React 插件 `@vitejs/plugin-react-swc` 4 → **`@vitejs/plugin-react` 6**：Vite 8 + Rolldown 自带 oxc 转换，官方推荐切回原版 `plugin-react`，移除 swc 二进制依赖。
+  - Tailwind 3.4 → **4.3**：新增 `@tailwindcss/postcss` PostCSS 插件，`postcss.config.js` 切换插件键名；`src/index.css` 用 `@import "tailwindcss"` 替代 `@tailwind base/components/utilities`，并通过 `@config "../tailwind.config.js"` 复用既有 hsl 主题变量与 `@apply` 配置。
+  - Radix UI 套件、`@tanstack/react-query`、`axios`、`lucide-react`、`sonner`、`tailwind-merge` 一并升到当前 latest。
+  - 新增 `src/vite-env.d.ts`（`/// <reference types="vite/client" />`），让 TS 6 严格模式下 `import './index.css'` 类型检查通过。
+- **构建产物分包优化**
+  - `vite.config.ts` 启用 `build.rolldownOptions.output.codeSplitting.groups`，按 `react` / `radix` / `query` / `icons` / `vendor` 拆分三方依赖 chunk，业务 chunk 体积全部回落到 500 kB 以下，便于浏览器缓存复用。
+  - `App.tsx` 改用 `lazy` + `Suspense` 懒加载 `Dashboard`，未登录用户首屏不再下载管理面板代码。
+
+### ✨ 新功能
+
+- **首次启动自动初始化配置文件**
+  - 启动时若 `config.json` 不存在，会自动写入一份最小默认配置：监听 `0.0.0.0:8990`、随机生成 `apiKey`（`sk-kiro-rs-...`）和 `adminApiKey`（`sk-admin-...`），并打印到日志。
+  - `credentials.json` 不存在时自动写入 `[]`，后续可直接在 Admin UI 添加凭据。
+  - Docker 首次部署不再需要手工准备 `data/config.json` / `data/credentials.json`，挂上 `data/` 目录直接 `docker compose up -d` 即可。
+- **镜像在线更新**
+  - 全新 Admin UI「镜像在线更新」面板：支持一键更新、回退、查看版本信息。
+  - compose 文件路径与 service 名运行时从当前容器的 docker compose 标签自动发现，前端无需配置。
+  - 更新前自动给当前镜像打 `kiro-rs:rollback` 本地 tag，断网也能一键回退到上一版本。
+  - 失败提示更友好：检测到 compose yml 不存在 / 是目录时给出可操作的中文提示。
+- **检查更新**
+  - 后台轮询 Docker Hub 仓库 tags，发现新语义化版本时在工具栏图标显示红点。
+  - 弹窗内展示「当前版本 / 最新版本 / 构建类型 / 发布时间」，并提供"立即检查"按钮。
+- **无人值守自动更新**
+  - 新增 `updateAutoApply` / `updateAutoApplyTime` 两个配置：开启后每天到指定时间自动检查并应用新版本，单分钟去重 + 单版本去重。
+  - Admin UI 提供开关 + 时间选择器，修改即时生效。
+- **凭据列表**
+  - 支持鼠标左键拖拽框选凭据，跨网格区域均可触发；按住 Ctrl/Meta 拖拽可附加到既有选区。
+  - 新增「全选当前页 / 取消全选」按钮，与既有"已选 N"徽章并存。
+  - 卡片左侧勾选框命中区放大到 28×28，更易点击。
+
+### 🎨 界面调整
+
+- 顶栏与登录页 logo 改为项目自定义 PNG（`kirors.png`），不再使用占位的渐变方块图标。
+- 镜像在线更新弹窗精简：标题旁的 ℹ️ 图标 hover/点击展示前置条件 Tooltip，不再占用主体空间。
+- Tooltip 触发逻辑修复：弹窗打开时不会再因为焦点自动落到 ℹ️ 上而立即弹出。
+
+### 🛠️ 维护
+
+- `Cargo.toml` 升级到 `0.3.0`；`admin-ui/package.json` 同步对齐到 `0.3.0`。
+- GitHub Actions 工作流（`release.yaml` / `docker-build.yaml`）切换到 Docker Hub 推送，使用 `DOCKERHUB_USERNAME` + `DOCKERHUB_TOKEN` secrets 登录。
+- Release Notes 自动从 `CHANGELOG.md` 抽取对应版本章节。
+
+### 📦 升级指南
+
+1. **Docker Hub 部署**（推荐）
+   - 直接使用 `zyphrzero/kiro-rs:latest` 替换现有镜像引用。
+   - 不再需要 `githubToken` 字段；默认 `docker-compose.yml` 已切换到 Docker Hub。
+2. **保留 GHCR 部署**
+   - 把 `updateImage` 改回 `ghcr.io/<owner>/kiro-rs:latest`；但此后该镜像不再随项目更新，请自行 fork 或镜像同步。
+3. **配置文件清理**
+   - 删除 `githubToken`、`updateComposeFile`、`updateService`（如果仍存在）。
+   - 如需开启每日自动更新，添加 `"updateAutoApply": true` 与 `"updateAutoApplyTime": "03:00"`。
+4. **首次发布**
+   - 维护者需在仓库 Settings → Secrets 添加 `DOCKERHUB_USERNAME` + `DOCKERHUB_TOKEN`，否则 CI 推送会失败。
