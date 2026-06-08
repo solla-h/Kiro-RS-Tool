@@ -7,7 +7,8 @@
 //! - 把 prompt 的稳定前缀按 message 边界切成一条递增前缀段链：
 //!   `[tools+system] → [+msg0] → [+msg1] → ... → [+msg(n-2)]`，每段 hash 是
 //!   「从头累积到该边界」的指纹，token 是该前缀的累计估算。
-//! - 最后一条 message（当前轮新输入）不切段——它是本轮 cache_creation 的尾部。
+//! - 最后一条 message（当前轮新输入）默认不切段；但如果其中的 content block
+//!   显式带 `cache_control`，则按 Anthropic 语义把该 block 作为本轮可写入的新断点。
 //! - lookup 取最深命中段 = 最长已缓存前缀 = `cache_read_input_tokens`；其后到
 //!   末段 = `cache_creation_input_tokens`；完全 miss → cache_read = 0。
 //!
@@ -93,8 +94,8 @@ impl CacheUsage {
         let cache_total = cache_total.min(total);
         // 在缓存覆盖部分内部，按 estimate 口径的 read/creation 占比二次拆分。
         let read = if self.cache_covered_est > 0 {
-            ((cache_total as f64) * (self.cache_read as f64 / self.cache_covered_est as f64)).round()
-                as i32
+            ((cache_total as f64) * (self.cache_read as f64 / self.cache_covered_est as f64))
+                .round() as i32
         } else {
             0
         };
@@ -313,8 +314,8 @@ struct Segment {
 /// （未被任何 cache_control 覆盖）属于真 input，不计入缓存——这正是 `prompt_total_est`
 /// 与 `cache_covered_est` 的差值。
 ///
-/// 没有任何 cache_control 断点时，返回全零的 `CacheUsage`（`split_against_total`
-/// 会把 total 全部计入 input）且不写入。
+/// 没有任何 cache_control 断点时，仍按历史 message 边界建立自动前缀链；只有单条
+/// 当前 user message、且无 system/tools/显式断点时，才没有可缓存覆盖。
 ///
 /// `key_id` 是客户端 Key id，用于会话隔离：前缀哈希会混入一个隔离种子（优先取
 /// 请求 metadata 里的 session，否则退回 key_id），使不同会话 / 不同客户端 Key 的
@@ -340,7 +341,10 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
             .zip(results.iter())
             .enumerate()
             .map(|(i, (s, r))| {
-                format!("[{i}] hash={} cum={} hit={}", s.hash, s.cumulative_tokens, r.hit)
+                format!(
+                    "[{i}] hash={} cum={} hit={}",
+                    s.hash, s.cumulative_tokens, r.hit
+                )
             })
             .collect();
         tracing::debug!(
@@ -408,6 +412,13 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&digest[..8]);
         let hash = u64::from_be_bytes(buf);
+        if let Some(last) = segments.last_mut()
+            && last.hash == hash
+            && last.cumulative_tokens == cum
+        {
+            last.ttl_secs = last.ttl_secs.max(ttl_secs);
+            return;
+        }
         segments.push(Segment {
             hash,
             cumulative_tokens: cum,
@@ -420,8 +431,10 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
     // 把 prompt 的稳定前缀按 message 边界切成一条**递增前缀段链**：
     //   [tools+system] → [+msg0] → [+msg1] → ... → [+msg(n-2)]
     // 每个段的 hash 是「从头累积到该边界」的指纹，token 是该前缀的累计估算。
-    // 最后一条 message（当前轮新输入）只喂进哈希算 prompt_total_est，**不切段**
-    // ——它是本轮 cache_creation 的尾部，且不应被当作可复用前缀。
+    // 最后一条 message（当前轮新输入）默认只喂进哈希算 prompt_total_est，**不切段**。
+    // 例外：如果最后一条 message 的 content block 显式带 cache_control，则该 block
+    // 就是客户端要求写入的新缓存断点，必须参与本轮 cache_creation。否则 CCH/Claude
+    // Code 的长当前输入会永远表现成“只读不写”，无法同时上报 read + creation。
     //
     // 为什么这样能跨轮命中：历史消息在多轮间逐字节不变，所以 Turn N+1 的
     // [+msg_k] 段 hash 必然等于 Turn N 写入的同一个 [+msg_k] 段。lookup 取最深
@@ -437,7 +450,12 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
     // 1. tools（全部喂入，作为前缀基础的一部分；工具定义跨轮稳定）。
     if let Some(tools) = req.tools.as_ref() {
         for t in tools {
-            feed(&mut hasher, &tool_signature(t), &tool_token_text(t), &mut cum_tokens);
+            feed(
+                &mut hasher,
+                &tool_signature(t),
+                &tool_token_text(t),
+                &mut cum_tokens,
+            );
         }
     }
 
@@ -457,7 +475,12 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
             .position(|s| s.cache_control.is_some())
             .unwrap_or(0);
         for sys in systems.iter().skip(skip_until) {
-            feed(&mut hasher, &system_signature(sys), &sys.text, &mut cum_tokens);
+            feed(
+                &mut hasher,
+                &system_signature(sys),
+                &sys.text,
+                &mut cum_tokens,
+            );
         }
     }
 
@@ -489,7 +512,8 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
                         hasher.update(media_type.as_bytes());
                         hasher.update(b"|");
                         hasher.update(data.as_bytes());
-                        let img_tokens = crate::image_resize::estimate_image_tokens(media_type, data);
+                        let img_tokens =
+                            crate::image_resize::estimate_image_tokens(media_type, data);
                         cum_tokens = cum_tokens.saturating_add(img_tokens);
                     } else {
                         feed(
@@ -499,11 +523,14 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
                             &mut cum_tokens,
                         );
                     }
+                    if block_has_cache_control(v) {
+                        commit(&hasher, cum_tokens, &mut segments, ttl);
+                    }
                 }
             }
             _ => {}
         }
-        // 最后一条不切段（当前轮新输入，属 cache_creation 尾部）。
+        // 自动前缀链：最后一条默认不切段；显式 cache_control 已在 block 级处理。
         if idx != last_idx {
             commit(&hasher, cum_tokens, &mut segments, ttl);
         }
@@ -616,6 +643,10 @@ fn block_token_text(v: &serde_json::Value) -> String {
     } else {
         format!("{text} {thinking}")
     }
+}
+
+fn block_has_cache_control(v: &serde_json::Value) -> bool {
+    v.get("cache_control").is_some()
 }
 
 /// 从 image content block 的 JSON 值取 `(media_type, base64_data)`。
@@ -843,7 +874,8 @@ mod tests {
     }
 
     #[test]
-    fn compute_cache_usage_tools_hit_regardless_of_schema_order() {        use super::super::types::{CacheControl, Message, MessagesRequest};
+    fn compute_cache_usage_tools_hit_regardless_of_schema_order() {
+        use super::super::types::{CacheControl, Message, MessagesRequest};
 
         let make_req = |insert_required_first: bool| {
             let mut tool = build_tool_with_schema_order(insert_required_first);
@@ -900,7 +932,9 @@ mod tests {
         }
     }
 
-    fn req_with_messages(messages: Vec<super::super::types::Message>) -> super::super::types::MessagesRequest {
+    fn req_with_messages(
+        messages: Vec<super::super::types::Message>,
+    ) -> super::super::types::MessagesRequest {
         use super::super::types::MessagesRequest;
         MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
@@ -1022,6 +1056,40 @@ mod tests {
             u4.cache_covered_est > u4.cache_read,
             "turn4 仍会为新增的历史前缀创建缓存"
         );
+    }
+
+    #[test]
+    fn explicit_cache_control_on_current_message_can_read_and_create() {
+        // 真实 Anthropic cache 可在同一请求里读到旧历史前缀，同时写入本轮
+        // 当前消息上的新 cache_control 断点。旧实现无条件跳过最后一条 message，
+        // 导致这类请求只能 read、不能 creation。
+        let cache = CacheMeter::new(None);
+        let body = "stable history prefix ".repeat(30);
+
+        let turn1 = req_with_messages(vec![
+            msg_with_cc("user", &body, false),
+            msg_with_cc("assistant", &body, false),
+            msg_with_cc("user", "current cacheable query one", true),
+        ]);
+        let u1 = compute_cache_usage(&cache, &turn1, 1);
+        assert_eq!(u1.cache_read, 0);
+        assert!(u1.cache_covered_est > 0);
+
+        let turn2 = req_with_messages(vec![
+            msg_with_cc("user", &body, false),
+            msg_with_cc("assistant", &body, false),
+            msg_with_cc("user", "current cacheable query two", true),
+        ]);
+        let u2 = compute_cache_usage(&cache, &turn2, 1);
+        assert!(u2.cache_read > 0, "应命中 turn1 的稳定历史前缀");
+        assert!(
+            u2.cache_covered_est > u2.cache_read,
+            "当前消息显式 cache_control 应产生新 creation 覆盖"
+        );
+
+        let (_input, creation, read) = u2.split_against_total(u2.prompt_total_est);
+        assert!(read > 0, "同一次请求应有 cache_read");
+        assert!(creation > 0, "同一次请求应有 cache_creation");
     }
 
     #[test]
@@ -1157,9 +1225,18 @@ mod tests {
             model: "claude-opus-4-8".to_string(),
             max_tokens: 64,
             messages: vec![
-                Message { role: "user".into(), content: serde_json::json!([{"type":"text","text":body}]) },
-                Message { role: "assistant".into(), content: serde_json::json!([{"type":"text","text":body}]) },
-                Message { role: "user".into(), content: serde_json::json!([{"type":"text","text":body}]) },
+                Message {
+                    role: "user".into(),
+                    content: serde_json::json!([{"type":"text","text":body}]),
+                },
+                Message {
+                    role: "assistant".into(),
+                    content: serde_json::json!([{"type":"text","text":body}]),
+                },
+                Message {
+                    role: "user".into(),
+                    content: serde_json::json!([{"type":"text","text":body}]),
+                },
             ],
             stream: false,
             system: None,
@@ -1236,7 +1313,10 @@ mod tests {
         // 用 image_resize 的同款 PNG 生成器造一张 750×750（≈750 token）的真图。
         let png = make_test_png(750, 750);
         let img_tokens = crate::image_resize::estimate_image_tokens("image/png", &png) as i32;
-        assert!(img_tokens > 100, "前提：测试图应有可观 token，实测 {img_tokens}");
+        assert!(
+            img_tokens > 100,
+            "前提：测试图应有可观 token，实测 {img_tokens}"
+        );
 
         let make = |trailing: &str| MessagesRequest {
             model: "m".to_string(),
@@ -1249,8 +1329,14 @@ mod tests {
                         {"type":"text","text":"describe"}
                     ]),
                 },
-                Message { role: "assistant".to_string(), content: serde_json::json!("a pixel") },
-                Message { role: "user".to_string(), content: serde_json::json!(trailing) },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("a pixel"),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!(trailing),
+                },
             ],
             stream: false,
             system: None,
@@ -1268,7 +1354,9 @@ mod tests {
         // 最深历史段至少覆盖到 [含图user] 段，covered 应 ≥ 图片 token（远大于纯文本）。
         assert!(
             u1.cache_covered_est >= img_tokens + text_only - 5,
-            "covered({}) 应含图片 token({})", u1.cache_covered_est, img_tokens
+            "covered({}) 应含图片 token({})",
+            u1.cache_covered_est,
+            img_tokens
         );
         assert_eq!(u1.cache_read, 0);
 
@@ -1276,7 +1364,9 @@ mod tests {
         let u2 = compute_cache_usage(&cache, &make("q2"), 1);
         assert!(
             u2.cache_read >= img_tokens,
-            "含图历史应跨轮命中且 read({}) 含图片 token({})", u2.cache_read, img_tokens
+            "含图历史应跨轮命中且 read({}) 含图片 token({})",
+            u2.cache_read,
+            img_tokens
         );
     }
 
@@ -1292,7 +1382,8 @@ mod tests {
             }
         }
         let mut buf = Vec::new();
-        img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png).unwrap();
+        img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+            .unwrap();
         B64.encode(&buf)
     }
 }
