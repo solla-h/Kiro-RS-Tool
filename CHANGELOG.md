@@ -6,6 +6,15 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2026.1.8] - 2026-06-10
+
+主题：**Admin 批量导入验活 hotfix**。本版本基于 `v2026.1.7`，补齐凭据导入后的瞬态上游故障处理，避免 502/429/网络抖动被误判为永久无效凭据。
+
+### 🛠 修复
+
+- **导入后验活失败不再误删凭据**：批量导入和 KAM 导入在遇到 502、429、网络错误、DNS/代理/超时等瞬态失败时保留凭据，并显示“已导入（待验活）”；仅在明确永久错误时回滚。
+- **余额查询增加瞬态重试**：新增凭据后清理旧余额缓存，并对 429、401/403 传播延迟、5xx 与网络类错误做短退避重试，减少刚导入即被前端二次验活打挂的概率。
+
 ## [0.6.2] - 2026-06-07
 
 主题：**Builder ID/free 流式对话 profileArn 400 修复 + 后台前端依赖清理**。v0.6.1 为规避占位符 ARN 的 403 风险，曾剥离 BuilderID 占位 `profileArn`；但新版 `q.* /generateAssistantResponse` 对 Builder ID/free 账号仍强制要求该字段，缺失会报 `400 "profileArn is required for this request."`。本版恢复纯 Builder ID/free 流式请求体的占位 ARN，同时保留 Enterprise / IdC 账号解析真实 ARN 的路径。
